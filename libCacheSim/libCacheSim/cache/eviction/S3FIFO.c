@@ -31,6 +31,8 @@ typedef struct {
   cache_t *fifo;
   cache_t *fifo_ghost;
   cache_t *main_cache;
+  cache_t *large_cache;  // LQ
+
   bool hit_on_ghost;
 
   int64_t n_obj_admit_to_fifo;
@@ -43,13 +45,26 @@ typedef struct {
   int move_to_main_threshold;
   double fifo_size_ratio;
   double ghost_size_ratio;
+
+  // DCP 
+  double s_ratio;   // 小型 FIFO (S) 的佔比
+  double m_ratio;   // 主 FIFO (M) 的佔比
+  double lq_ratio;  // 大物件 LQ 的佔比
+
+   // Weighted Eviction
+  double alpha, beta, gamma;
+
   char main_cache_type[32];
 
   request_t *req_local;
 } S3FIFO_params_t;
 
 static const char *DEFAULT_CACHE_PARAMS =
-    "fifo-size-ratio=0.10,ghost-size-ratio=0.90,move-to-main-threshold=2";
+    "s-ratio=0.10,m-ratio=0.70,lq-ratio=0.20,"
+    "ghost-size-ratio=0.90,move-to-main-threshold=2,"
+    "alpha=1.0,beta=0.5,gamma=2.0";
+
+#define SOME_SCORE_THRESHOLD 5.0  // 根據實際需求調整
 
 // ***********************************************************************
 // ****                                                               ****
@@ -66,6 +81,7 @@ static cache_obj_t *S3FIFO_find(cache_t *cache, const request_t *req,
 static cache_obj_t *S3FIFO_insert(cache_t *cache, const request_t *req);
 static cache_obj_t *S3FIFO_to_evict(cache_t *cache, const request_t *req);
 static void S3FIFO_evict(cache_t *cache, const request_t *req);
+static void S3FIFO_evict_lq(cache_t *cache, const request_t *req);
 static bool S3FIFO_remove(cache_t *cache, const obj_id_t obj_id);
 static inline int64_t S3FIFO_get_occupied_byte(const cache_t *cache);
 static inline int64_t S3FIFO_get_n_obj(const cache_t *cache);
@@ -75,6 +91,7 @@ static void S3FIFO_parse_params(cache_t *cache,
 
 static void S3FIFO_evict_fifo(cache_t *cache, const request_t *req);
 static void S3FIFO_evict_main(cache_t *cache, const request_t *req);
+static double compute_weighted_score(cache_obj_t *obj, S3FIFO_params_t *params);
 
 // ***********************************************************************
 // ****                                                               ****
@@ -111,14 +128,16 @@ cache_t *S3FIFO_init(const common_cache_params_t ccache_params,
     S3FIFO_parse_params(cache, cache_specific_params);
   }
 
-  int64_t fifo_cache_size =
-      (int64_t)ccache_params.cache_size * params->fifo_size_ratio;
-  int64_t main_cache_size = ccache_params.cache_size - fifo_cache_size;
+  int64_t s_size  = (int64_t)(ccache_params.cache_size * params->s_ratio);
+  int64_t m_size  = (int64_t)(ccache_params.cache_size * params->m_ratio);
+  int64_t lq_size = (int64_t)(ccache_params.cache_size * params->lq_ratio);
+
   int64_t fifo_ghost_cache_size =
       (int64_t)(ccache_params.cache_size * params->ghost_size_ratio);
 
   common_cache_params_t ccache_params_local = ccache_params;
-  ccache_params_local.cache_size = fifo_cache_size;
+  // S
+  ccache_params_local.cache_size = s_size;
   params->fifo = FIFO_init(ccache_params_local, NULL);
 
   if (fifo_ghost_cache_size > 0) {
@@ -130,8 +149,14 @@ cache_t *S3FIFO_init(const common_cache_params_t ccache_params,
     params->fifo_ghost = NULL;
   }
 
-  ccache_params_local.cache_size = main_cache_size;
+  // M
+  ccache_params_local.cache_size = m_size;
   params->main_cache = FIFO_init(ccache_params_local, NULL);
+
+  // LQ (large object)
+  ccache_params_local.cache_size = lq_size;
+  params->large_cache = FIFO_init(ccache_params_local, NULL);
+  snprintf(params->large_cache->cache_name, CACHE_NAME_ARRAY_LEN, "FIFO-LQ");
 
 #if defined(TRACK_EVICTION_V_AGE)
   if (params->fifo_ghost != NULL) {
@@ -189,6 +214,9 @@ static bool S3FIFO_get(cache_t *cache, const request_t *req) {
                    params->main_cache->get_occupied_byte(params->main_cache) <=
                cache->cache_size);
 
+  // 呼叫 DCP 檢查並調整
+  DCP_check_and_adjust(cache);
+
   bool cache_hit = cache_get_base(cache, req);
 
   return cache_hit;
@@ -209,11 +237,10 @@ static bool S3FIFO_get(cache_t *cache, const request_t *req) {
  *  and if the object is expired, it is removed from the cache
  * @return the object or NULL if not found
  */
-static cache_obj_t *S3FIFO_find(cache_t *cache, const request_t *req,
-                                const bool update_cache) {
+static cache_obj_t *S3FIFO_find(cache_t *cache, const request_t *req, const bool update_cache) {
   S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
 
-  // if update cache is false, we only check the fifo and main caches
+  // 如果不更新快取，只檢查 S, M, LQ
   if (!update_cache) {
     cache_obj_t *obj = params->fifo->find(params->fifo, req, false);
     if (obj != NULL) {
@@ -223,8 +250,40 @@ static cache_obj_t *S3FIFO_find(cache_t *cache, const request_t *req,
     if (obj != NULL) {
       return obj;
     }
+    obj = params->large_cache->find(params->large_cache, req, false);
+    if (obj != NULL) {
+      return obj;
+    }
     return NULL;
   }
+
+  // 更新快取
+  params->hit_on_ghost = false;
+  cache_obj_t *obj = params->fifo->find(params->fifo, req, true);
+  if (obj != NULL) {
+    obj->S3FIFO.freq += 1;
+    return obj;
+  }
+
+  if (params->fifo_ghost != NULL &&
+      params->fifo_ghost->remove(params->fifo_ghost, req->obj_id)) {
+    // 如果物件在 ghost 中，設置命中 ghost
+    params->hit_on_ghost = true;
+  }
+
+  obj = params->main_cache->find(params->main_cache, req, true);
+  if (obj != NULL) {
+    obj->S3FIFO.freq += 1;
+  }
+
+  // 嘗試在 LQ 中查找
+  obj = params->large_cache->find(params->large_cache, req, true);
+  if (obj != NULL) {
+    obj->S3FIFO.freq += 1;
+  }
+
+  return obj;
+}
 
   /* update cache is true from now */
   params->hit_on_ghost = false;
@@ -264,32 +323,31 @@ static cache_obj_t *S3FIFO_insert(cache_t *cache, const request_t *req) {
   cache_obj_t *obj = NULL;
 
   if (params->hit_on_ghost) {
-    /* insert into the ARC */
+    // insert into the main cache
     params->hit_on_ghost = false;
-    params->n_obj_admit_to_main += 1;
-    params->n_byte_admit_to_main += req->obj_size;
     obj = params->main_cache->insert(params->main_cache, req);
   } else {
-    /* insert into the fifo */
-    if (req->obj_size >= params->fifo->cache_size) {
-      return NULL;
+    // 判斷是否為大物件
+    if (req->obj_size > size_threshold) {  // 定義 size_threshold
+      obj = params->large_cache->insert(params->large_cache, req);
+    } else {
+      // 小物件 => 放 S
+      obj = params->fifo->insert(params->fifo, req);
     }
-    params->n_obj_admit_to_fifo += 1;
-    params->n_byte_admit_to_fifo += req->obj_size;
-    obj = params->fifo->insert(params->fifo, req);
   }
 
-#if defined(TRACK_EVICTION_V_AGE)
-  obj->create_time = CURR_TIME(cache, req);
-#endif
-
-#if defined(TRACK_DEMOTION)
-  obj->create_time = cache->n_req;
-#endif
-
-  obj->S3FIFO.freq == 0;
+  // 初始化 freq
+  if (obj != NULL) {
+    obj->S3FIFO.freq = 0;
+  }
 
   return obj;
+}
+
+static double compute_weighted_score(cache_obj_t *obj, S3FIFO_params_t *params) {
+  return params->alpha * obj->S3FIFO.freq
+         - params->beta * log(obj->obj_size)
+         + params->gamma * obj->reloadCost;
 }
 
 /**
@@ -315,94 +373,65 @@ static void S3FIFO_evict_fifo(cache_t *cache, const request_t *req) {
 
   bool has_evicted = false;
   while (!has_evicted && fifo->get_occupied_byte(fifo) > 0) {
-    // evict from FIFO
+    // 取出 FIFO 尾端物件
     cache_obj_t *obj_to_evict = fifo->to_evict(fifo, req);
     DEBUG_ASSERT(obj_to_evict != NULL);
-    // need to copy the object before it is evicted
-    copy_cache_obj_to_request(params->req_local, obj_to_evict);
-
-    if (obj_to_evict->S3FIFO.freq >= params->move_to_main_threshold) {
-#if defined(TRACK_DEMOTION)
-      printf("%ld keep %ld %ld\n", cache->n_req, obj_to_evict->create_time,
-             obj_to_evict->misc.next_access_vtime);
-#endif
-      // freq is updated in cache_find_base
-      params->n_obj_move_to_main += 1;
-      params->n_byte_move_to_main += obj_to_evict->obj_size;
-
-      cache_obj_t *new_obj = main->insert(main, params->req_local);
-      new_obj->misc.freq = obj_to_evict->misc.freq;
-#if defined(TRACK_EVICTION_V_AGE)
-      new_obj->create_time = obj_to_evict->create_time;
+    
+    // 計算加權分數
+    double score = params->alpha * obj_to_evict->S3FIFO.freq
+                   - params->beta * log(obj_to_evict->obj_size)
+                   + params->gamma * obj_to_evict->reloadCost;
+    
+    if (score >= SOME_SCORE_THRESHOLD) {
+      // 分數高，移到 M
+      main->insert(main, obj_to_evict->req_local);
     } else {
-      record_eviction_age(cache, obj_to_evict,
-                          CURR_TIME(cache, req) - obj_to_evict->create_time);
-#else
-    } else {
-#endif
-
-#if defined(TRACK_DEMOTION)
-      printf("%ld demote %ld %ld\n", cache->n_req, obj_to_evict->create_time,
-             obj_to_evict->misc.next_access_vtime);
-#endif
-
-      // insert to ghost
+      // 分數低，踢到 ghost
       if (ghost != NULL) {
-        ghost->get(ghost, params->req_local);
+        ghost->get(ghost, obj_to_evict->req_local);
       }
-      has_evicted = true;
     }
-
-    // remove from fifo, but do not update stat
-    bool removed = fifo->remove(fifo, params->req_local->obj_id);
+    
+    // 從 FIFO 中移除物件
+    bool removed = fifo->remove(fifo, obj_to_evict->obj_id);
     assert(removed);
+    
+    has_evicted = true;
   }
 }
 
 static void S3FIFO_evict_main(cache_t *cache, const request_t *req) {
   S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
-  cache_t *fifo = params->fifo;
-  cache_t *ghost = params->fifo_ghost;
   cache_t *main = params->main_cache;
+  cache_t *ghost = params->fifo_ghost;
 
-  // evict from main cache
   bool has_evicted = false;
-  while (!has_evicted && main->get_occupied_byte(main) > 0) {
+  while (!has_evicted && main->get_occupied_byte(main) > main->cache_size) {
+    // 取出主快取尾端物件
     cache_obj_t *obj_to_evict = main->to_evict(main, req);
     DEBUG_ASSERT(obj_to_evict != NULL);
-    int freq = obj_to_evict->S3FIFO.freq;
-#if defined(TRACK_EVICTION_V_AGE)
-    int64_t create_time = obj_to_evict->create_time;
-#endif
-    copy_cache_obj_to_request(params->req_local, obj_to_evict);
-    if (freq >= 1) {
-      // we need to evict first because the object to insert has the same obj_id
-      // main->evict(main, req);
-      main->remove(main, obj_to_evict->obj_id);
-      obj_to_evict = NULL;
-
-      cache_obj_t *new_obj = main->insert(main, params->req_local);
-      // clock with 2-bit counter
-      new_obj->S3FIFO.freq = MIN(freq, 3) - 1;
-      new_obj->misc.freq = freq;
-
-#if defined(TRACK_EVICTION_V_AGE)
-      new_obj->create_time = create_time;
-#endif
+    
+    // 計算加權分數
+    double score = params->alpha * obj_to_evict->S3FIFO.freq
+                   - params->beta * log(obj_to_evict->obj_size)
+                   + params->gamma * obj_to_evict->reloadCost;
+    
+    if (score >= SOME_SCORE_THRESHOLD) {
+      // 分數高，保留在主快取，更新頻率
+      obj_to_evict->S3FIFO.freq = MIN(obj_to_evict->S3FIFO.freq, 3) - 1;
+      main->insert(main, obj_to_evict->req_local);
     } else {
-#if defined(TRACK_EVICTION_V_AGE)
-      record_eviction_age(cache, obj_to_evict,
-                          CURR_TIME(cache, req) - obj_to_evict->create_time);
-#endif
-
-      // main->evict(main, req);
-      bool removed = main->remove(main, obj_to_evict->obj_id);
-      if (!removed) {
-        ERROR("cannot remove obj %ld\n", obj_to_evict->obj_id);
+      // 分數低，踢到 ghost
+      if (ghost != NULL) {
+        ghost->get(ghost, obj_to_evict->req_local);
       }
-
-      has_evicted = true;
     }
+    
+    // 從主快取中移除物件
+    bool removed = main->remove(main, obj_to_evict->obj_id);
+    assert(removed);
+    
+    has_evicted = true;
   }
 }
 
@@ -421,12 +450,51 @@ static void S3FIFO_evict(cache_t *cache, const request_t *req) {
   cache_t *fifo = params->fifo;
   cache_t *ghost = params->fifo_ghost;
   cache_t *main = params->main_cache;
+  cache_t *large = params->large_cache;
 
-  if (main->get_occupied_byte(main) > main->cache_size ||
-      fifo->get_occupied_byte(fifo) == 0) {
-    return S3FIFO_evict_main(cache, req);
+  // 判斷 S, M, LQ 是否超量
+  if (fifo->get_occupied_byte(fifo) > fifo->cache_size) {
+    S3FIFO_evict_fifo(cache, req);
+  } else if (main->get_occupied_byte(main) > main->cache_size) {
+    S3FIFO_evict_main(cache, req);
+  } else if (large->get_occupied_byte(large) > large->cache_size) {
+    S3FIFO_evict_lq(cache, req);
   }
-  return S3FIFO_evict_fifo(cache, req);
+}
+
+static void S3FIFO_evict_lq(cache_t *cache, const request_t *req) {
+  S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
+  cache_t *large = params->large_cache;
+  cache_t *main = params->main_cache;
+  cache_t *ghost = params->fifo_ghost;
+
+  bool has_evicted = false;
+  while (!has_evicted && large->get_occupied_byte(large) > large->cache_size) {
+    // 取出 LQ 尾端物件
+    cache_obj_t *obj_to_evict = large->to_evict(large, req);
+    DEBUG_ASSERT(obj_to_evict != NULL);
+    
+    // 計算加權分數
+    double score = params->alpha * obj_to_evict->S3FIFO.freq
+                   - params->beta * log(obj_to_evict->obj_size)
+                   + params->gamma * obj_to_evict->reloadCost;
+    
+    if (score >= SOME_SCORE_THRESHOLD) {
+      // 分數高，升級到 M
+      main->insert(main, obj_to_evict->req_local);
+    } else {
+      // 分數低，踢到 ghost
+      if (ghost != NULL) {
+        ghost->get(ghost, obj_to_evict->req_local);
+      }
+    }
+    
+    // 移除 LQ 中的物件
+    bool removed = large->remove(large, obj_to_evict->obj_id);
+    assert(removed);
+    
+    has_evicted = true;
+  }
 }
 
 /**
@@ -456,9 +524,9 @@ static bool S3FIFO_remove(cache_t *cache, const obj_id_t obj_id) {
 static inline int64_t S3FIFO_get_occupied_byte(const cache_t *cache) {
   S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
   return params->fifo->get_occupied_byte(params->fifo) +
-         params->main_cache->get_occupied_byte(params->main_cache);
+         params->main_cache->get_occupied_byte(params->main_cache) +
+         params->large_cache->get_occupied_byte(params->large_cache);
 }
-
 static inline int64_t S3FIFO_get_n_obj(const cache_t *cache) {
   S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
   return params->fifo->get_n_obj(params->fifo) +
@@ -468,8 +536,81 @@ static inline int64_t S3FIFO_get_n_obj(const cache_t *cache) {
 static inline bool S3FIFO_can_insert(cache_t *cache, const request_t *req) {
   S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
 
-  return req->obj_size <= params->fifo->cache_size;
+  if (req->obj_size > params->size_threshold) {
+    return req->obj_size <= params->large_cache->cache_size;
+  } else {
+    return req->obj_size <= params->fifo->cache_size;
+  }
 }
+
+// 回傳固定的大物件請求量
+static double get_recent_large_requests(cache_t *cache) {
+    return 100.0;
+}
+
+// 回傳固定的小物件請求量
+static double get_recent_small_requests(cache_t *cache) {
+    return 300.0;
+}
+
+static void DCP_check_and_adjust(cache_t *cache) {
+    S3FIFO_params_t *params = (S3FIFO_params_t *)cache->eviction_params;
+
+    // 使用固定值來模擬近期的大物件和小物件請求量
+    double recent_large_requests = get_recent_large_requests(cache);
+    double recent_small_requests = get_recent_small_requests(cache);
+    
+    // 定義調整的門檻值和步驟
+    const double LARGE_REQUEST_THRESHOLD = 200.0;
+    const double SMALL_REQUEST_THRESHOLD = 400.0;
+    const double ADJUST_RATIO_STEP = 0.05;
+
+    // 根據請求量調整比例
+    if (recent_large_requests > LARGE_REQUEST_THRESHOLD) {
+        // 增加 LQ 區域或給 M 更多空間
+        params->lq_ratio += ADJUST_RATIO_STEP;
+        params->s_ratio -= ADJUST_RATIO_STEP / 2;
+        params->m_ratio -= ADJUST_RATIO_STEP / 2;
+    } else if (recent_small_requests > SMALL_REQUEST_THRESHOLD) {
+        // 減少 LQ，釋放空間給 S 和 M
+        params->lq_ratio -= ADJUST_RATIO_STEP;
+        params->s_ratio += ADJUST_RATIO_STEP / 2;
+        params->m_ratio += ADJUST_RATIO_STEP / 2;
+    }
+    
+    // 確保比例總和為 1
+    normalize_ratios(params);
+
+    // 更新快取區大小
+    int64_t s_size  = (int64_t)(cache->cache_size * params->s_ratio);
+    int64_t m_size  = (int64_t)(cache->cache_size * params->m_ratio);
+    int64_t lq_size = (int64_t)(cache->cache_size * params->lq_ratio);
+    
+    // 更新各快取區域大小
+    resize_cache(params->fifo, s_size);
+    resize_cache(params->main_cache, m_size);
+    resize_cache(params->large_cache, lq_size);
+    
+    // 呼叫剔除流程以適應新大小
+    if (params->fifo->get_occupied_byte(params->fifo) > s_size) {
+        S3FIFO_evict_fifo(cache, NULL);
+    }
+    if (params->main_cache->get_occupied_byte(params->main_cache) > m_size) {
+        S3FIFO_evict_main(cache, NULL);
+    }
+    if (params->large_cache->get_occupied_byte(params->large_cache) > lq_size) {
+        S3FIFO_evict_lq(cache, NULL);
+    }
+}
+
+
+static void normalize_ratios(S3FIFO_params_t *params) {
+  double total = params->s_ratio + params->m_ratio + params->lq_ratio;
+  params->s_ratio /= total;
+  params->m_ratio /= total;
+  params->lq_ratio /= total;
+}
+
 
 // ***********************************************************************
 // ****                                                               ****
@@ -508,6 +649,18 @@ static void S3FIFO_parse_params(cache_t *cache,
       params->ghost_size_ratio = strtod(value, NULL);
     } else if (strcasecmp(key, "move-to-main-threshold") == 0) {
       params->move_to_main_threshold = atoi(value);
+    } else if (strcasecmp(key, "s-ratio") == 0) {
+      params->s_ratio = strtod(value, NULL);
+    } else if (strcasecmp(key, "m-ratio") == 0) {
+      params->m_ratio = strtod(value, NULL);
+    } else if (strcasecmp(key, "lq-ratio") == 0) {
+      params->lq_ratio = strtod(value, NULL);
+    } else if (strcasecmp(key, "alpha") == 0) {
+      params->alpha = strtod(value, NULL);
+    } else if (strcasecmp(key, "beta") == 0) {
+      params->beta = strtod(value, NULL);
+    } else if (strcasecmp(key, "gamma") == 0) {
+      params->gamma = strtod(value, NULL);
     } else if (strcasecmp(key, "print") == 0) {
       printf("parameters: %s\n", S3FIFO_current_params(params));
       exit(0);
